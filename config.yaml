@@ -1,0 +1,11 @@
+app:
+  db_file: "jobs.json"
+  users_file: "users.json"
+  job_timeout_hours: 6
+  confirmation_timeout_minutes: 1
+  admin_id: 0000000000 # Kendi ID'ni yaz
+
+anti_ban:
+  base_interval_seconds: 60
+  max_backoff_minutes: 15
+  jitter_seconds: 30
