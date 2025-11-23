@@ -213,3 +213,62 @@ func authMiddleware(next tele.HandlerFunc) tele.HandlerFunc {
 		return nil
 	}
 }
+
+// --- SERVİS FONKSİYONLARI ---
+
+func getStations() ([]Station, error) {
+	apiUrl := os.Getenv("API_URL")
+	authKey := os.Getenv("AUTH_KEY")
+	unitId := os.Getenv("UNIT_ID")
+	req, _ := http.NewRequest("GET", apiUrl, nil)
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authorization", "Bearer "+authKey)
+	req.Header.Add("unit-id", unitId)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("Status: %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var stations []Station
+	json.Unmarshal(body, &stations)
+	return stations, nil
+}
+
+func getTrains(fromId int, fromName string, toId int, toName string, date string) (*TrainResponse, error) {
+	searchUrl := os.Getenv("SEARCH_URL")
+	authKey := os.Getenv("AUTH_KEY")
+	unitId := os.Getenv("UNIT_ID")
+	payload := SearchRequest{
+		SearchRoutes:      []SearchRoute{{DepartureStationId: fromId, DepartureStationName: fromName, ArrivalStationId: toId, ArrivalStationName: toName, DepartureDate: date}},
+		PassengerCounts:   []PassengerTypeCount{{Id: 0, Count: 1}},
+		SearchReservation: false,
+	}
+	jsonData, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", searchUrl, bytes.NewBuffer(jsonData))
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authorization", "Bearer "+authKey)
+	req.Header.Add("unit-id", unitId)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		if resp.StatusCode == 400 {
+			return nil, fmt.Errorf("400")
+		}
+		return nil, fmt.Errorf("API Error: %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var trainResp TrainResponse
+	if err := json.Unmarshal(body, &trainResp); err != nil {
+		return nil, err
+	}
+	return &trainResp, nil
+}
