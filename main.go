@@ -420,3 +420,37 @@ func checkAndNotify(b *tele.Bot, recipient tele.Recipient, fromID int, fromName 
 	}
 	return false, false
 }
+
+// --- YARDIMCI FONKSİYONLAR ---
+func findStationID(name string, stations []Station) (int, string) {
+	search := strings.ToLower(name)
+	replacer := strings.NewReplacer("ı", "i", "ş", "s", "ç", "c", "ğ", "g", "ü", "u", "ö", "o")
+	search = replacer.Replace(search)
+	for _, s := range stations {
+		dbName := strings.ToLower(s.Name)
+		dbName = replacer.Replace(dbName)
+		if strings.Contains(dbName, search) {
+			return s.ID, s.Name
+		}
+	}
+	return 0, ""
+}
+func normalizeDate(input string) string {
+	if strings.Contains(input, ".") {
+		parts := strings.Split(input, ".")
+		if len(parts) == 3 {
+			return fmt.Sprintf("%s-%s-%s 00:00:00", parts[0], parts[1], parts[2])
+		}
+	}
+	return input
+}
+func parseTimeToMinutes(timeStr string) int {
+	cleanStr := strings.ReplaceAll(timeStr, ".", ":")
+	parts := strings.Split(cleanStr, ":")
+	if len(parts) != 2 {
+		return -1
+	}
+	hour, _ := strconv.Atoi(parts[0])
+	minute, _ := strconv.Atoi(parts[1])
+	return (hour * 60) + minute
+}
