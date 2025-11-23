@@ -272,3 +272,151 @@ func getTrains(fromId int, fromName string, toId int, toName string, date string
 	}
 	return &trainResp, nil
 }
+
+// --- OTOMASYON FONKSİYONU ---
+
+func startMonitoring(b *tele.Bot, job *Job) {
+	recipient := &tele.Chat{ID: job.ChatID}
+	shouldAbort, isApiError := checkAndNotify(b, recipient, job.FromID, job.FromName, job.ToID, job.ToName, job.Date, job.FilterStart, job.FilterEnd, true)
+	if shouldAbort {
+		cleanupJob(job.ChatID)
+		return
+	}
+	consecutiveErrors := 0
+	if isApiError {
+		consecutiveErrors = 1
+	}
+
+	baseInterval := time.Duration(cfg.AntiBan.BaseIntervalSec) * time.Second
+	maxBackoff := time.Duration(cfg.AntiBan.MaxBackoffMin) * time.Minute
+	timeoutDuration := time.Duration(cfg.App.JobTimeoutHours) * time.Hour
+	confirmTimeout := time.Duration(cfg.App.ConfirmTimeoutMins) * time.Minute
+
+	for {
+		waitDuration := baseInterval
+		if consecutiveErrors > 0 {
+			multiplier := 1 << consecutiveErrors
+			backoffWait := baseInterval * time.Duration(multiplier)
+			if backoffWait > maxBackoff {
+				backoffWait = maxBackoff
+			}
+			waitDuration = backoffWait
+		}
+		jitter := time.Duration(rand.Intn(cfg.AntiBan.JitterSec)) * time.Second
+		totalWait := waitDuration + jitter
+
+		select {
+		case <-job.StopChan:
+			return
+		case <-time.After(totalWait):
+			if time.Since(job.StartTime) > timeoutDuration {
+				msg := fmt.Sprintf("⏳ **Süre Doldu!**\nDevam etmek için %d dakika içinde **/devam** yazın.", cfg.App.ConfirmTimeoutMins)
+				b.Send(recipient, msg, tele.ModeMarkdown)
+				select {
+				case <-job.ContinueChan:
+					job.StartTime = time.Now()
+					saveJobs()
+					b.Send(recipient, "✅ **Süre uzatıldı!**")
+					consecutiveErrors = 0
+				case <-time.After(confirmTimeout):
+					b.Send(recipient, "🛑 **Zaman Aşımı.**")
+					cleanupJob(job.ChatID)
+					return
+				case <-job.StopChan:
+					return
+				}
+			} else {
+				abort, apiErr := checkAndNotify(b, recipient, job.FromID, job.FromName, job.ToID, job.ToName, job.Date, job.FilterStart, job.FilterEnd, false)
+				if abort {
+					cleanupJob(job.ChatID)
+					return
+				}
+				if apiErr {
+					consecutiveErrors++
+					fmt.Printf("⚠️ API Hatası (%d). Sayı: %d.\n", job.ChatID, consecutiveErrors)
+				} else {
+					consecutiveErrors = 0
+				}
+			}
+		}
+	}
+}
+
+func cleanupJob(chatID int64) {
+	jobsMutex.Lock()
+	if _, exists := activeJobs[chatID]; exists {
+		delete(activeJobs, chatID)
+	}
+	jobsMutex.Unlock()
+	saveJobs()
+}
+
+func checkAndNotify(b *tele.Bot, recipient tele.Recipient, fromID int, fromName string, toID int, toName string, date string, fStart, fEnd int, isFirstRun bool) (bool, bool) {
+	result, err := getTrains(fromID, fromName, toID, toName, date)
+	if err != nil {
+		if err.Error() == "400" {
+			if isFirstRun {
+				b.Send(recipient, "⚠️ **Hatalı İstek!** Formatı kontrol edin.")
+			}
+			return true, false
+		}
+		if isFirstRun {
+			b.Send(recipient, "❌ Sunucu hatası.")
+		}
+		return false, true
+	}
+
+	var buffer bytes.Buffer
+	foundAny := false
+	buffer.WriteString(fmt.Sprintf("🚨 **BİLET BULUNDU!** 🚨\n📅 %s\n\n", date))
+
+	for _, leg := range result.TrainLegs {
+		for _, availability := range leg.TrainAvailabilities {
+			for _, train := range availability.Trains {
+				trainTimeMinutes := -1
+				departureTimeStr := "--:--"
+				if len(train.Segments) > 0 {
+					ts := train.Segments[0].DepartureTime
+					t := time.UnixMilli(ts)
+					departureTimeStr = t.Format("15:04")
+					trainTimeMinutes = (t.Hour() * 60) + t.Minute()
+				}
+				if fStart != -1 && fEnd != -1 {
+					if trainTimeMinutes < fStart || trainTimeMinutes > fEnd {
+						continue
+					}
+				}
+				economySeats := 0
+				price := 0.0
+				if len(train.AvailableFareInfo) > 0 {
+					for _, cabin := range train.AvailableFareInfo[0].CabinClasses {
+						if cabin.CabinClass != nil && cabin.CabinClass.Name == "EKONOMİ" {
+							economySeats = int(cabin.AvailabilityCount)
+							price = cabin.MinPrice
+						}
+					}
+				}
+				if price == 0 && train.MinPrice != nil {
+					price = train.MinPrice.PriceAmount
+				}
+
+				if economySeats > 0 {
+					foundAny = true
+					seatIcon := "🟢"
+					if economySeats < 5 {
+						seatIcon = "🔴"
+					}
+					buffer.WriteString(fmt.Sprintf("🕒 **%s** - %s\n", departureTimeStr, train.Name))
+					buffer.WriteString(fmt.Sprintf("%s Yer: **%d** | %.2f TL\n", seatIcon, economySeats, price))
+					buffer.WriteString("-------------------------\n")
+				}
+			}
+		}
+	}
+	if foundAny {
+		b.Send(recipient, buffer.String(), tele.ModeMarkdown)
+	} else if isFirstRun {
+		b.Send(recipient, "❌ Şu an boş yer yok.\n🔄 **Otomatik takip başlatıldı.**\n(6 Saat boyunca aranacak)\nDurdurmak için: /iptal")
+	}
+	return false, false
+}
