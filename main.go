@@ -454,3 +454,208 @@ func parseTimeToMinutes(timeStr string) int {
 	minute, _ := strconv.Atoi(parts[1])
 	return (hour * 60) + minute
 }
+
+// --- ANA PROGRAM ---
+
+func main() {
+	_ = godotenv.Load()
+	loadConfig()
+
+	pref := tele.Settings{
+		Token:  os.Getenv("TELEGRAM_TOKEN"),
+		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
+	}
+
+	b, err := tele.NewBot(pref)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Başlarken verileri yükle
+	loadUsers()
+	loadAndRecoverJobs(b)
+
+	// --- YENİ KOMUTLAR: KULLANICI YÖNETİMİ ---
+
+	// /adduser 123456
+	b.Handle("/adduser", func(c tele.Context) error {
+		// Sadece SUPER ADMIN kullanabilir
+		if c.Sender().ID != cfg.App.AdminID {
+			return nil
+		}
+
+		args := c.Args()
+		if len(args) == 0 {
+			return c.Reply("⚠️ ID girmelisiniz: `/adduser 12345`")
+		}
+
+		newUserID, err := strconv.ParseInt(args[0], 10, 64)
+		if err != nil {
+			return c.Reply("❌ Geçersiz ID.")
+		}
+
+		usersMutex.Lock()
+		allowedUsers[newUserID] = true
+		usersMutex.Unlock()
+		saveUsers()
+
+		return c.Reply(fmt.Sprintf("✅ Kullanıcı eklendi: %d", newUserID))
+	})
+
+	// /deluser 123456
+	b.Handle("/deluser", func(c tele.Context) error {
+		if c.Sender().ID != cfg.App.AdminID {
+			return nil
+		}
+
+		args := c.Args()
+		if len(args) == 0 {
+			return c.Reply("⚠️ ID girmelisiniz: `/deluser 12345`")
+		}
+
+		delUserID, err := strconv.ParseInt(args[0], 10, 64)
+		if err != nil {
+			return c.Reply("❌ Geçersiz ID.")
+		}
+
+		usersMutex.Lock()
+		delete(allowedUsers, delUserID)
+		usersMutex.Unlock()
+		saveUsers()
+
+		return c.Reply(fmt.Sprintf("🗑️ Kullanıcı silindi: %d", delUserID))
+	})
+
+	// /users (Listele)
+	b.Handle("/users", func(c tele.Context) error {
+		if c.Sender().ID != cfg.App.AdminID {
+			return nil
+		}
+
+		usersMutex.Lock()
+		count := len(allowedUsers)
+		var listStr string
+		for id := range allowedUsers {
+			listStr += fmt.Sprintf("- `%d`\n", id)
+		}
+		usersMutex.Unlock()
+
+		return c.Reply(fmt.Sprintf("👥 **İzinli Kullanıcılar (%d):**\n\n%s", count, listStr), tele.ModeMarkdown)
+	})
+
+	// --- GENEL KOMUTLAR (MIDDLEWARE İLE KORUMALI) ---
+
+	b.Handle("/find", authMiddleware(func(c tele.Context) error {
+		args := c.Args()
+		chatID := c.Chat().ID
+
+		if len(args) < 2 {
+			return c.Send("⚠️ Kullanım: `/find Nereden Nereye Tarih`", tele.ModeMarkdown)
+		}
+
+		jobsMutex.Lock()
+		if job, exists := activeJobs[chatID]; exists {
+			close(job.StopChan)
+			delete(activeJobs, chatID)
+			c.Send("⚠️ Önceki arama iptal edildi, yenisi başlatılıyor...")
+		}
+		jobsMutex.Unlock()
+
+		fromInput, toInput := args[0], args[1]
+		tomorrow := time.Now().Add(24 * time.Hour)
+		queryDate := tomorrow.Format("02-01-2006") + " 00:00:00"
+		if len(args) >= 3 {
+			queryDate = normalizeDate(args[2])
+		}
+		filterStart, filterEnd := -1, -1
+		if len(args) == 5 {
+			filterStart = parseTimeToMinutes(args[3])
+			filterEnd = parseTimeToMinutes(args[4])
+		}
+
+		c.Send("🔍 İstasyonlar kontrol ediliyor...")
+		stations, err := getStations()
+		if err != nil {
+			return c.Reply("Hata: İstasyon listesi çekilemedi.")
+		}
+
+		fromID, fromName := findStationID(fromInput, stations)
+		toID, toName := findStationID(toInput, stations)
+
+		if fromID == 0 || toID == 0 {
+			return c.Reply("❌ İstasyon bulunamadı.")
+		}
+
+		newJob := &Job{
+			ChatID: chatID, FromID: fromID, FromName: fromName, ToID: toID, ToName: toName, Date: queryDate,
+			FilterStart: filterStart, FilterEnd: filterEnd, StartTime: time.Now(),
+			StopChan: make(chan struct{}), ContinueChan: make(chan struct{}),
+		}
+
+		jobsMutex.Lock()
+		activeJobs[chatID] = newJob
+		jobsMutex.Unlock()
+		saveJobs()
+
+		go startMonitoring(b, newJob)
+		return nil
+	}))
+
+	b.Handle("/iptal", authMiddleware(func(c tele.Context) error {
+		chatID := c.Chat().ID
+		jobsMutex.Lock()
+		if job, exists := activeJobs[chatID]; exists {
+			close(job.StopChan)
+			delete(activeJobs, chatID)
+			jobsMutex.Unlock()
+			saveJobs()
+			return c.Reply("✅ Otomatik arama iptal edildi.")
+		}
+		jobsMutex.Unlock()
+		return c.Reply("⚠️ Zaten aktif bir aramanız yok.")
+	}))
+
+	b.Handle("/devam", authMiddleware(func(c tele.Context) error {
+		chatID := c.Chat().ID
+		jobsMutex.Lock()
+		defer jobsMutex.Unlock()
+		if job, exists := activeJobs[chatID]; exists {
+			select {
+			case job.ContinueChan <- struct{}{}:
+				return c.Reply("👍 İsteğiniz işleniyor...")
+			default:
+				return c.Reply("⚠️ Şu an süre uzatılacak bir durum yok.")
+			}
+		}
+		return c.Reply("⚠️ Aktif arama yok.")
+	}))
+
+	// --- SHUTDOWN ---
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		fmt.Println("🚀 Tren Botu (Multi-User Mode) Başlatıldı!")
+		b.Start()
+	}()
+
+	<-quit
+	fmt.Println("\n🛑 Kapanıyor...")
+	jobsMutex.Lock()
+	var jobsToClose []*Job
+	for _, job := range activeJobs {
+		jobsToClose = append(jobsToClose, job)
+	}
+	jobsMutex.Unlock()
+
+	for _, job := range jobsToClose {
+		go b.Send(&tele.Chat{ID: job.ChatID}, "⚠️ Bakım nedeniyle kapatıldı.")
+		select {
+		case <-job.StopChan:
+		default:
+			close(job.StopChan)
+		}
+	}
+	time.Sleep(2 * time.Second)
+	fmt.Println("✅ Başarıyla kapatıldı.")
+}
