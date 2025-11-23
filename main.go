@@ -187,3 +187,29 @@ func loadAndRecoverJobs(b *tele.Bot) {
 		go startMonitoring(b, job)
 	}
 }
+
+// --- GÜVENLİK MIDDLEWARE ---
+// Hem Admin'e hem de Ekli Kullanıcılara izin verir
+func authMiddleware(next tele.HandlerFunc) tele.HandlerFunc {
+	return func(c tele.Context) error {
+		userID := c.Sender().ID
+
+		// 1. Süper Admin mi?
+		if userID == cfg.App.AdminID {
+			return next(c)
+		}
+
+		// 2. İzinli listede var mı?
+		usersMutex.Lock()
+		allowed := allowedUsers[userID]
+		usersMutex.Unlock()
+
+		if allowed {
+			return next(c)
+		}
+
+		// İzin yoksa sessizce reddet (Log düş)
+		fmt.Printf("⛔ Yetkisiz Erişim: %d (%s)\n", userID, c.Sender().Username)
+		return nil
+	}
+}
