@@ -63,3 +63,127 @@ var jobsMutex sync.Mutex
 // İzinli Kullanıcılar Listesi
 var allowedUsers = make(map[int64]bool)
 var usersMutex sync.Mutex
+
+// --- AYARLARI YÜKLE ---
+func loadConfig() {
+	f, err := os.Open("config.yaml")
+	if err != nil {
+		log.Fatal("❌ config.yaml okunamadı:", err)
+	}
+	defer f.Close()
+	decoder := yaml.NewDecoder(f)
+	if err := decoder.Decode(&cfg); err != nil {
+		log.Fatal("❌ YAML hatası:", err)
+	}
+	// Varsayılan dosya adı (Config'de yoksa)
+	if cfg.App.UsersFile == "" {
+		cfg.App.UsersFile = "users.json"
+	}
+	fmt.Println("⚙️  Ayarlar yüklendi.")
+}
+
+// --- PERSISTENCE: USER MANAGEMENT ---
+
+func saveUsers() {
+	usersMutex.Lock()
+	defer usersMutex.Unlock()
+
+	// Map'i listeye çevir
+	var userList []int64
+	for id := range allowedUsers {
+		userList = append(userList, id)
+	}
+
+	data, err := json.MarshalIndent(userList, "", "  ")
+	if err != nil {
+		fmt.Println("❌ Kullanıcı kayıt hatası:", err)
+		return
+	}
+	_ = os.WriteFile(cfg.App.UsersFile, data, 0644)
+}
+
+func loadUsers() {
+	usersMutex.Lock()
+	defer usersMutex.Unlock()
+
+	fileData, err := os.ReadFile(cfg.App.UsersFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return // Dosya yoksa sorun yok, liste boş başlar
+		}
+		fmt.Println("❌ Kullanıcı dosyası okuma hatası:", err)
+		return
+	}
+
+	var userList []int64
+	if err := json.Unmarshal(fileData, &userList); err != nil {
+		fmt.Println("❌ Kullanıcı JSON hatası:", err)
+		return
+	}
+
+	for _, id := range userList {
+		allowedUsers[id] = true
+	}
+	fmt.Printf("👥 %d izinli kullanıcı yüklendi.\n", len(allowedUsers))
+}
+
+// --- PERSISTENCE: JOB MANAGEMENT ---
+
+func saveJobs() {
+	jobsMutex.Lock()
+	defer jobsMutex.Unlock()
+	var jobList []*Job
+	for _, job := range activeJobs {
+		jobList = append(jobList, job)
+	}
+	data, _ := json.MarshalIndent(jobList, "", "  ")
+	_ = os.WriteFile(cfg.App.DBFile, data, 0644)
+}
+
+func loadAndRecoverJobs(b *tele.Bot) {
+	jobsMutex.Lock()
+	defer jobsMutex.Unlock()
+
+	fileData, err := os.ReadFile(cfg.App.DBFile)
+	if err != nil {
+		return
+	}
+
+	var jobList []*Job
+	if err := json.Unmarshal(fileData, &jobList); err != nil {
+		return
+	}
+
+	fmt.Printf("🔄 %d kayıtlı görev geri yükleniyor...\n", len(jobList))
+	timeoutDuration := time.Duration(cfg.App.JobTimeoutHours) * time.Hour
+
+	for _, job := range jobList {
+		if time.Since(job.StartTime) > timeoutDuration {
+			continue
+		}
+		trainDate, err := time.Parse("02-01-2006 15:04:05", job.Date)
+		if err == nil {
+			if trainDate.Add(24 * time.Hour).Before(time.Now()) {
+				continue
+			}
+		}
+
+		job.StopChan = make(chan struct{})
+		job.ContinueChan = make(chan struct{})
+		activeJobs[job.ChatID] = job
+
+		filterText := "Tüm Gün"
+		if job.FilterStart != -1 && job.FilterEnd != -1 {
+			startH := job.FilterStart / 60
+			startM := job.FilterStart % 60
+			endH := job.FilterEnd / 60
+			endM := job.FilterEnd % 60
+			filterText = fmt.Sprintf("%02d:%02d - %02d:%02d", startH, startM, endH, endM)
+		}
+		infoMsg := fmt.Sprintf("🔄 **Sistem Yeniden Başlatıldı.**\nArama devam ediyor:\n📍 %s -> %s\n📅 %s\n🕒 %s",
+			job.FromName, job.ToName, job.Date, filterText)
+
+		go b.Send(&tele.Chat{ID: job.ChatID}, infoMsg, tele.ModeMarkdown)
+		go startMonitoring(b, job)
+	}
+}
